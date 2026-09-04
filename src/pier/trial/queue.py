@@ -190,37 +190,31 @@ class TrialQueue:
     def _submit_batch_pinned(
         self, configs: list[TrialConfig]
     ) -> list[Coroutine[Any, Any, TrialResult]]:
-        """Split trials across backends. One worker per backend, serial within.
+        """Shared queue across workers. Each worker pulls the next trial
+        when it finishes one — no pre-assignment, no long tail from
+        unlucky splits.
 
         Each trial gets a Future. Workers resolve futures as they finish.
         Each returned coroutine just awaits its own future — the caller's
         TaskGroup drives them all, and results come back in order.
         """
         n_workers = len(self._backends)
-
-        # Assign each trial to a worker and create a future for its result
-        futures: list[asyncio.Future[TrialResult]] = []
-        worker_items: list[list[tuple[TrialConfig, asyncio.Future[TrialResult]]]] = [
-            [] for _ in range(n_workers)
-        ]
+        queue: asyncio.Queue[tuple[TrialConfig, asyncio.Future[TrialResult]]] = (
+            asyncio.Queue()
+        )
 
         loop = asyncio.get_event_loop()
-        for i, config in enumerate(configs):
+        futures: list[asyncio.Future[TrialResult]] = []
+        for config in configs:
             fut: asyncio.Future[TrialResult] = loop.create_future()
             futures.append(fut)
-            if n_workers == 1:
-                wid = 0
-            else:
-                wid = i % n_workers
-            worker_items[wid].append((config, fut))
+            queue.put_nowait((config, fut))
 
-        # Start all workers as background tasks
         for wid in range(n_workers):
             asyncio.ensure_future(
-                self._worker(wid, self._backends[wid], worker_items[wid])
+                self._worker(wid, self._backends[wid], queue)
             )
 
-        # Return one coroutine per trial that awaits its future
         async def _await_future(fut: asyncio.Future[TrialResult]) -> TrialResult:
             return await fut
 
@@ -230,10 +224,14 @@ class TrialQueue:
         self,
         worker_id: int,
         backend_url: str,
-        items: list[tuple[TrialConfig, "asyncio.Future[TrialResult]"]],
+        queue: "asyncio.Queue[tuple[TrialConfig, asyncio.Future[TrialResult]]]",
     ) -> None:
-        """Process trials serially on one backend, resolving futures."""
-        for config, fut in items:
+        """Pull trials from a shared queue, run serially on one backend."""
+        while not queue.empty():
+            try:
+                config, fut = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
             try:
                 pinned = self._pin_backend(config, backend_url)
                 self._logger.debug(

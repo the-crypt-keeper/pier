@@ -114,7 +114,7 @@ auth_param basic realm PierPolicyProxy
 acl authenticated proxy_auth REQUIRED
 
 acl SSL_ports port 443
-acl Safe_ports port 80 443
+acl Safe_ports port 80 443 8001-8052
 acl CONNECT method CONNECT
 acl allowed_domains dstdomain "/tmp/allowed_domains.txt"
 

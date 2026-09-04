@@ -110,6 +110,7 @@ class TrialQueue:
         config = trial_config.model_copy(deep=True)
         config.agent.env["OPENAI_BASE_URL"] = backend_url
         config.agent.env["OPENAI_API_BASE"] = backend_url
+        config.agent.env["HOSTED_VLLM_API_BASE"] = backend_url
         return config
 
     async def _execute_trial_with_retries(

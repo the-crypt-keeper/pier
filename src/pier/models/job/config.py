@@ -226,7 +226,22 @@ class JobConfig(BaseModel):
     environment_build_timeout_multiplier: float | None = None
     debug: bool = Field(default=False, description="Enable debug logging")
     n_concurrent_trials: int = 4
+    backends: list[str] = Field(
+        default_factory=list,
+        description="Inference backend URLs. Empty: use env as-is. "
+        "Length 1: all trials share it. "
+        "Length N (== n_concurrent_trials): trial i pins to backend i.",
+    )
     quiet: bool = Field(default=False, description="Suppress trial progress displays")
+
+    @model_validator(mode="after")
+    def _validate_backends(self):
+        if self.backends and len(self.backends) not in (1, self.n_concurrent_trials):
+            raise ValueError(
+                f"backends must be empty, length 1, or length n_concurrent_trials "
+                f"({self.n_concurrent_trials}), got {len(self.backends)}"
+            )
+        return self
     retry: RetryConfig = Field(default_factory=RetryConfig)
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     verifier: VerifierConfig = Field(default_factory=VerifierConfig)

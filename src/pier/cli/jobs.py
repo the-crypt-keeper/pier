@@ -274,6 +274,16 @@ def start(
             show_default=False,
         ),
     ] = None,
+    backends: Annotated[
+        list[str] | None,
+        Option(
+            "--backend",
+            help="Inference backend URL. Repeat for multiple backends "
+            "(one per concurrent trial). Pins each trial to its backend.",
+            rich_help_panel="Job Settings",
+            show_default=False,
+        ),
+    ] = None,
     max_retries: Annotated[
         int | None,
         Option(
@@ -623,6 +633,8 @@ def start(
 
     if n_concurrent_trials is not None:
         config.n_concurrent_trials = n_concurrent_trials
+    if backends is not None:
+        config.backends = backends
     if quiet:
         config.quiet = quiet
     if max_retries is not None:

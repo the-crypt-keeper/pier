@@ -16,8 +16,8 @@ class TrialQueue:
 
     Receives TrialConfigs, creates Trial objects internally, runs them
     with retry logic, and returns TrialResult tasks. Concurrency is
-    bounded by an asyncio.Semaphore. Hooks are wired to each Trial
-    instance — Trial handles all event invocations.
+    bounded by an asyncio.Semaphore (no backends) or by N serial workers
+    (with backends — one worker per backend, trials pinned 1:1).
     """
 
     def __init__(
@@ -25,6 +25,7 @@ class TrialQueue:
         n_concurrent: int,
         retry_config: RetryConfig | None = None,
         hooks: dict[TrialEvent, list[HookCallback]] | None = None,
+        backends: list[str] | None = None,
     ):
         if hooks is None:
             hooks = {event: [] for event in TrialEvent}
@@ -37,6 +38,7 @@ class TrialQueue:
         self._hooks = hooks
         self._logger = logger.getChild(__name__)
         self._semaphore = asyncio.Semaphore(n_concurrent)
+        self._backends = backends or []
 
     def add_hook(self, event: TrialEvent, callback: HookCallback) -> "TrialQueue":
         """Register a callback for a trial lifecycle event and return the queue."""
@@ -102,6 +104,14 @@ class TrialQueue:
             for hook in hooks:
                 trial.add_hook(event, hook)
 
+    @staticmethod
+    def _pin_backend(trial_config: TrialConfig, backend_url: str) -> TrialConfig:
+        """Return a copy of the config with OPENAI_BASE_URL pinned."""
+        config = trial_config.model_copy(deep=True)
+        config.agent.env["OPENAI_BASE_URL"] = backend_url
+        config.agent.env["OPENAI_API_BASE"] = backend_url
+        return config
+
     async def _execute_trial_with_retries(
         self, trial_config: TrialConfig
     ) -> TrialResult:
@@ -165,5 +175,70 @@ class TrialQueue:
     ) -> list[Coroutine[Any, Any, TrialResult]]:
         """
         Return coroutines for multiple trials, ordered to match `configs`.
+
+        Without backends: each coroutine acquires a semaphore slot.
+        With backends: trials are assigned to workers round-robin. Each
+        worker runs its trials serially on one backend. Each coroutine
+        still returns one TrialResult — the caller sees no difference.
         """
-        return [self.submit(config) for config in configs]
+        if not self._backends:
+            return [self.submit(config) for config in configs]
+
+        return self._submit_batch_pinned(configs)
+
+    def _submit_batch_pinned(
+        self, configs: list[TrialConfig]
+    ) -> list[Coroutine[Any, Any, TrialResult]]:
+        """Split trials across backends. One worker per backend, serial within.
+
+        Each trial gets a Future. Workers resolve futures as they finish.
+        Each returned coroutine just awaits its own future — the caller's
+        TaskGroup drives them all, and results come back in order.
+        """
+        n_workers = len(self._backends)
+
+        # Assign each trial to a worker and create a future for its result
+        futures: list[asyncio.Future[TrialResult]] = []
+        worker_items: list[list[tuple[TrialConfig, asyncio.Future[TrialResult]]]] = [
+            [] for _ in range(n_workers)
+        ]
+
+        loop = asyncio.get_event_loop()
+        for i, config in enumerate(configs):
+            fut: asyncio.Future[TrialResult] = loop.create_future()
+            futures.append(fut)
+            if n_workers == 1:
+                wid = 0
+            else:
+                wid = i % n_workers
+            worker_items[wid].append((config, fut))
+
+        # Start all workers as background tasks
+        for wid in range(n_workers):
+            asyncio.ensure_future(
+                self._worker(wid, self._backends[wid], worker_items[wid])
+            )
+
+        # Return one coroutine per trial that awaits its future
+        async def _await_future(fut: asyncio.Future[TrialResult]) -> TrialResult:
+            return await fut
+
+        return [_await_future(f) for f in futures]
+
+    async def _worker(
+        self,
+        worker_id: int,
+        backend_url: str,
+        items: list[tuple[TrialConfig, "asyncio.Future[TrialResult]"]],
+    ) -> None:
+        """Process trials serially on one backend, resolving futures."""
+        for config, fut in items:
+            try:
+                pinned = self._pin_backend(config, backend_url)
+                self._logger.debug(
+                    f"Worker {worker_id}: {config.trial_name} -> {backend_url}"
+                )
+                result = await self._execute_trial_with_retries(pinned)
+                fut.set_result(result)
+            except Exception as exc:
+                fut.set_exception(exc)

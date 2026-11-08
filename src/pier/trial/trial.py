@@ -2,8 +2,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import shlex
 import shutil
+import tempfile
 import traceback
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -394,9 +396,52 @@ class Trial:
         artifacts_dir: Path,
         artifacts: Sequence[str | ArtifactConfig] | None = None,
     ) -> VerifierResult:
+        """A verifier whose Dockerfile declares `ARG BASE_IMAGE` is built on the rebuilt task image.
+
+        MaxxBench (unlap-labs/maxxbench run.py, Apache-2.0) mutates DeepSWE tasks, and some of its verifiers build
+        FROM the mutated task image rather than the published one. The image name is handed over through a
+        compose build arg written into a copy of the tests dir, so the task tree is never edited and concurrent
+        trials never share the file. Verifiers without the ARG take the original path unchanged.
+        """
+        context = self._verifier_env_build_context(step_cfg)
+        dockerfile = context / "Dockerfile"
+        needs_image = dockerfile.is_file() and re.search(
+            r"(?m)^\s*ARG\s+BASE_IMAGE\s*$", dockerfile.read_text()
+        )
+        arguments = dict(
+            key=key, step_cfg=step_cfg, verifier_env=verifier_env,
+            artifacts_dir=artifacts_dir, artifacts=artifacts,
+        )
+        if not needs_image:
+            return await self._verify_in_separate_environment(env_config, context, **arguments)
+
+        image = getattr(getattr(self._environment, "_env_vars", None), "main_image_name", None)
+        if not image:
+            raise RuntimeError("This verifier requires the rebuilt Docker task image.")
+        if (context / "docker-compose.yaml").exists():
+            raise RuntimeError("Refusing to replace an existing verifier Compose file.")
+
+        with tempfile.TemporaryDirectory(prefix="pier-verifier-") as directory:
+            temporary_context = Path(directory) / "tests"
+            shutil.copytree(context, temporary_context)
+            compose = {"services": {"main": {"build": {"args": {"BASE_IMAGE": image}}}}}
+            (temporary_context / "docker-compose.yaml").write_text(json.dumps(compose, indent=2) + "\n")
+            return await self._verify_in_separate_environment(env_config, temporary_context, **arguments)
+
+    async def _verify_in_separate_environment(
+        self,
+        env_config: TaskEnvironmentConfig,
+        build_context: Path,
+        *,
+        key: str,
+        step_cfg: StepConfig | None,
+        verifier_env: dict[str, str] | None,
+        artifacts_dir: Path,
+        artifacts: Sequence[str | ArtifactConfig] | None = None,
+    ) -> VerifierResult:
         env = EnvironmentFactory.create_environment_from_config(
             config=self.config.environment,
-            environment_dir=self._verifier_env_build_context(step_cfg),
+            environment_dir=build_context,
             environment_name=self._task.name,
             session_id=self._separate_verifier_session_id(key),
             trial_paths=self._trial_paths,
